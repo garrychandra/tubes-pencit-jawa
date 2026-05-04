@@ -6,6 +6,8 @@ from PIL import Image
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
 import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize as sk_skeletonize, thin as sk_thin
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. OTSU THRESHOLDING
@@ -50,41 +52,44 @@ def apply_threshold(gray: np.ndarray, t: int) -> np.ndarray:
 # 2. MORPHOLOGY
 # ──────────────────────────────────────────────────────────────────────────────
 
-def erode(image: np.ndarray, kernel_size: int = 1) -> np.ndarray:
+def erode(image: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+    """Optimized erosion using NumPy slicing."""
     H, W = image.shape
     pad = kernel_size // 2
-    output = np.zeros_like(image)
-    padded = np.pad(image, pad_width=pad, mode="constant", constant_values=0)
-
-    # iterasi semua pixel, kalo tidak fit dengan kernel, jadiin hitam (asumsi setelah di threshold)
-    for i in range(H):
-        for j in range(W):
-            current_min = 255
-            for ri in range(kernel_size):
-                for ci in range(kernel_size):
-                    val = padded[i + ri, j + ci]
-                    if val < current_min:
-                        current_min = val
-            output[i, j] = current_min
+    # Pad with 255 (white) because erosion takes the minimum
+    padded = np.pad(image, pad, mode="constant", constant_values=255)
+    output = np.full_like(image, 255)
+    
+    for i in range(kernel_size):
+        for j in range(kernel_size):
+            output = np.minimum(output, padded[i:i+H, j:j+W])
     return output
 
 def dilate(image: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+    """Optimized dilation using NumPy slicing."""
     H, W = image.shape
     pad = kernel_size // 2
+    # Pad with 0 (black) because dilation takes the maximum
+    padded = np.pad(image, pad, mode="constant", constant_values=0)
     output = np.zeros_like(image)
-    padded = np.pad(image, pad_width=pad, mode="constant", constant_values=0)
-
-    # iterasi semua pixel, kalo ada hit di kernel, jadiin putih (asumsi setelah di threshold)
-    for i in range(H):
-        for j in range(W):
-            current_max = 0
-            for ri in range(kernel_size):
-                for ci in range(kernel_size):
-                    val = padded[i + ri, j + ci]
-                    if val > current_max:
-                        current_max = val
-            output[i, j] = current_max
+    
+    for i in range(kernel_size):
+        for j in range(kernel_size):
+            output = np.maximum(output, padded[i:i+H, j:j+W])
     return output
+
+def apply_thinning(binary: np.ndarray) -> np.ndarray:
+    """Applies Zhang-Suen thinning via skimage."""
+    # skimage works best with boolean arrays
+    bool_img = binary > 0
+    thinned = sk_thin(bool_img)
+    return (thinned * 255).astype(np.uint8)
+
+def apply_skeletonize(binary: np.ndarray) -> np.ndarray:
+    """Applies skeletonization via skimage."""
+    bool_img = binary > 0
+    skeleton = sk_skeletonize(bool_img)
+    return (skeleton * 255).astype(np.uint8)
 
  #dilasi -> erosi
 def closing(image: np.ndarray, kernel_size: int = 3) -> np.ndarray:
@@ -132,49 +137,86 @@ def center_character(binary: np.ndarray, target_size=(64, 64)) -> np.ndarray:
 # 4. DATASET LOADING (Aksara Jawa v3)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_aksara_v3(base_path, target_size=(64, 64), max_per_class=1000):
+def load_aksara_v3(base_path, target_size=(64, 64), max_per_class=1000, use_thinning=False, use_skeleton=False):
     X = []
     y = []
-    classes = sorted(os.listdir(base_path))
+    
+    # 1. Tentukan folder tujuan preprocess
+    suffix = f"_{target_size[0]}x{target_size[1]}"
+    if use_thinning: suffix += "_thin"
+    if use_skeleton: suffix += "_skel"
+    
+    # Folder hasil preprocess akan disimpan di folder yang sama dengan v3 tapi ada suffix _processed
+    processed_base = base_path.rstrip("/") + "_processed" + suffix
+    
+    classes = sorted([d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))])
     class_to_idx = {cls: i for i, cls in enumerate(classes)}
+
+    # Cek apakah folder processed sudah ada
+    if os.path.exists(processed_base):
+        print(f"Loading pre-processed images from {processed_base}...")
+        for cls in classes:
+            cls_dir = os.path.join(processed_base, cls)
+            if not os.path.exists(cls_dir): continue
+            
+            files = [f for f in os.listdir(cls_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+            for f in files[:max_per_class]:
+                img_path = os.path.join(cls_dir, f)
+                img = Image.open(img_path).convert('L')
+                X.append(np.array(img).flatten())
+                y.append(class_to_idx[cls])
+        return np.array(X), np.array(y), classes
+
+    # Jika belum ada, lakukan preprocessing
+    print(f"Pre-processing and saving Aksara Jawa to {processed_base}...")
+    os.makedirs(processed_base, exist_ok=True)
     
-    print(f"Loading Aksara Jawa from {base_path}...")
-    total_files = sum([len(os.listdir(os.path.join(base_path, c))) for c in classes])
     processed_count = 0
-    
     for cls in classes:
         cls_dir = os.path.join(base_path, cls)
-        # load semua file 
-        files = os.listdir(cls_dir)
+        save_dir = os.path.join(processed_base, cls)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        files = [f for f in os.listdir(cls_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
         count = 0
         for f in files:
+            if count >= max_per_class: break
+            
             img_path = os.path.join(cls_dir, f)
             try:
-                # load gambar jadi grayscale agar jadi 1 channel
                 img = Image.open(img_path).convert('L')
                 gray = np.array(img)
                 
-                # thresholding dengan otsu
+                # Thresholding
                 t = otsu_threshold(gray)
                 binary = apply_threshold(gray, t)
                 
-                # morphologi
+                # Morphologi
                 cleaned = closing(binary, kernel_size=3)
                 
-                # centering
+                # Tambahan: Thinning atau Skeletonize
+                if use_thinning:
+                    cleaned = apply_thinning(cleaned)
+                elif use_skeleton:
+                    cleaned = apply_skeletonize(cleaned)
+                
+                # Centering
                 centered = center_character(cleaned, target_size=target_size)
                 
-                # simpan ke dataset
+                # Simpan ke folder preprocess agar tidak perlu ulang
+                save_path = os.path.join(save_dir, f)
+                Image.fromarray(centered).save(save_path)
+                
                 X.append(centered.flatten())
                 y.append(class_to_idx[cls])
                 count += 1
                 processed_count += 1
                 
-                if processed_count % 50 == 0:
+                if processed_count % 100 == 0:
                     print(f"  Processed {processed_count} images total...")
             except Exception as e:
                 print(f"Error loading {img_path}: {e}")
-        print(f"  Class '{cls}': loaded {count} images")
+        print(f"  Class '{cls}': processed {count} images")
         
     return np.array(X), np.array(y), classes
 
@@ -189,16 +231,24 @@ def main():
     # load data
     MAX_PER_CLASS = 1000 
     IMG_SIZE = (64, 64) 
+    USE_THINNING = False  # Ubah jadi True jika ingin pakai thinning
+    USE_SKELETON = False # Ubah jadi True jika ingin pakai skeleton
     
-    X_train, y_train, classes = load_aksara_v3(train_path, target_size=IMG_SIZE, max_per_class=MAX_PER_CLASS)
-    X_val, y_val, _ = load_aksara_v3(val_path, target_size=IMG_SIZE, max_per_class=MAX_PER_CLASS)
+    X_train, y_train, classes = load_aksara_v3(train_path, target_size=IMG_SIZE, 
+                                             max_per_class=MAX_PER_CLASS,
+                                             use_thinning=USE_THINNING, 
+                                             use_skeleton=USE_SKELETON)
+    X_val, y_val, _ = load_aksara_v3(val_path, target_size=IMG_SIZE, 
+                                   max_per_class=MAX_PER_CLASS,
+                                   use_thinning=USE_THINNING, 
+                                   use_skeleton=USE_SKELETON)
     
     print(f"\nTotal Training Samples: {len(X_train)}")
     print(f"Total Validation Samples: {len(X_val)}")
 
     # random forest
     print(f"\nTraining Random Forest (500 trees) on {len(X_train)} samples...")
-    rf = RandomForestClassifier(n_estimators=500, n_jobs=-1, random_state=42)
+    rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
     rf.fit(X_train, y_train)
 
     # evaluasi
@@ -209,7 +259,7 @@ def main():
 
     # simpan model
     model_data = {'model': rf, 'classes': classes, 'img_size': IMG_SIZE}
-    joblib.dump(model_data, 'aksara_jawa_v3_model.joblib')
+    joblib.dump(model_data, 'aksara_jawa_v3_model_100.joblib')
     print("\nModel saved to 'aksara_jawa_v3_model.joblib'")
 
 if __name__ == "__main__":
